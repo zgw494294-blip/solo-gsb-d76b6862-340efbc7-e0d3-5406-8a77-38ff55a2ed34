@@ -1,0 +1,402 @@
+"""FastAPI 后端：参数校验 + 酶切计算 + 静态页面。"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+from .assembly import (
+    MAX_TARGET_LEN,
+    MIN_TARGET_LEN,
+    AssemblyInputError,
+    fragment_assembly,
+)
+from .digest import IUPAC_BASES, compute_digest, compute_partial_digest
+from .inference import (
+    MAX_BANDS,
+    MAX_MISSING,
+    MAX_TOLERANCE,
+    MIN_BANDS,
+    MIN_MISSING,
+    MIN_TOLERANCE,
+    digest_inference,
+)
+from .isolation import MAX_SPACING, MIN_SPACING, fragment_isolation
+from .redesign import RedesignInputError, synonymous_redesign
+
+app = FastAPI(title="DNA 虚拟平切酶酶切图谱", version="1.5.0")
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+DNA_RE = re.compile(r"^[ACGT]+$")
+IUPAC_RE = re.compile(r"^[" + re.escape("".join(IUPAC_BASES)) + r"]+$")
+WHITESPACE_RE = re.compile(r"\s+")
+
+MIN_DNA_LEN, MAX_DNA_LEN = 4, 5000
+MIN_ENZYMES, MAX_ENZYMES = 1, 8
+MIN_SITE_LEN, MAX_SITE_LEN = 3, 12
+
+# 同义移除位点的参数范围
+REDESIGN_MIN_DNA_LEN, REDESIGN_MAX_DNA_LEN = 6, 300
+REDESIGN_MIN_ENZYMES, REDESIGN_MAX_ENZYMES = 1, 3
+REDESIGN_MIN_SITE_LEN, REDESIGN_MAX_SITE_LEN = 3, 6
+
+
+class EnzymeRule(BaseModel):
+    id: str
+    site: str
+    offset: int
+
+
+class PartialEnzymeRule(EnzymeRule):
+    # 单点切开概率：每个识别位点独立地以该概率被切开（0～1）
+    cut_probability: float = 1.0
+
+
+class DigestRequest(BaseModel):
+    sequence: str
+    topology: str
+    enzymes: list[EnzymeRule]
+
+
+class PartialDigestRequest(BaseModel):
+    sequence: str
+    topology: str
+    enzymes: list[PartialEnzymeRule]
+
+
+class RedesignEnzymeRule(BaseModel):
+    # 同义重设计只关心识别串；偏移与切开概率与本功能无关
+    id: str
+    site: str
+    offset: int | None = None
+    cut_probability: float | None = None
+
+
+class SynonymousRedesignRequest(BaseModel):
+    sequence: str
+    topology: str
+    enzymes: list[RedesignEnzymeRule]
+
+
+class DigestInferenceRequest(BaseModel):
+    sequence: str
+    topology: str
+    enzymes: list[EnzymeRule]  # 反推做完全酶切，忽略单点切开概率
+    observed_bands: list[int]
+    tolerance: int = 0
+    max_missing: int = 0
+
+
+class FragmentIsolationRequest(BaseModel):
+    sequence: str
+    topology: str
+    enzymes: list[EnzymeRule]  # 分离设计做完全酶切，忽略单点切开概率
+    target_start: int
+    target_end: int
+    min_spacing: int
+
+
+class FragmentAssemblyRequest(BaseModel):
+    sequence: str
+    topology: str
+    enzymes: list[EnzymeRule]  # 拼接做完全酶切，忽略单点切开概率
+    target_sequence: str
+
+
+def _bad_request(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail=message)
+
+
+def _normalize_inputs(
+    raw_sequence: str, raw_topology: str, raw_enzymes: list[EnzymeRule]
+) -> tuple[str, str, list[dict]]:
+    """/api/digest 与 /api/partial-digest 共用的参数校验与规范化。"""
+    # ---- DNA 序列 ----
+    sequence = WHITESPACE_RE.sub("", raw_sequence).upper()
+    if not MIN_DNA_LEN <= len(sequence) <= MAX_DNA_LEN:
+        raise _bad_request(f"DNA 序列长度须为 {MIN_DNA_LEN}～{MAX_DNA_LEN} bp（当前 {len(sequence)} bp）")
+    if not DNA_RE.fullmatch(sequence):
+        raise _bad_request("DNA 序列只能包含 A、C、G、T 字符")
+
+    # ---- 拓扑 ----
+    if raw_topology not in ("linear", "circular"):
+        raise _bad_request("拓扑类型须为 linear（线性）或 circular（环状）")
+
+    # ---- 酶规则 ----
+    if not MIN_ENZYMES <= len(raw_enzymes) <= MAX_ENZYMES:
+        raise _bad_request(f"酶规则数量须为 {MIN_ENZYMES}～{MAX_ENZYMES} 条（当前 {len(raw_enzymes)} 条）")
+
+    normalized_enzymes: list[dict] = []
+    seen_ids: set[str] = set()
+    for raw in raw_enzymes:
+        enzyme_id = raw.id.strip()
+        if not enzyme_id:
+            raise _bad_request("每条酶规则都必须填写唯一 ID")
+        if enzyme_id in seen_ids:
+            raise _bad_request(f"酶 ID 重复：{enzyme_id}")
+        seen_ids.add(enzyme_id)
+
+        site = WHITESPACE_RE.sub("", raw.site).upper()
+        if not MIN_SITE_LEN <= len(site) <= MAX_SITE_LEN:
+            raise _bad_request(
+                f"酶 {enzyme_id} 的识别串长度须为 {MIN_SITE_LEN}～{MAX_SITE_LEN} 位"
+            )
+        if not IUPAC_RE.fullmatch(site):
+            raise _bad_request(
+                f"酶 {enzyme_id} 的识别串含非法字符，仅允许 IUPAC 码："
+                "A C G T R Y S W K M B D H V N"
+            )
+        if len(site) > len(sequence):
+            raise _bad_request(f"酶 {enzyme_id} 的识别串（{len(site)} 位）不能长于 DNA 序列（{len(sequence)} 位）")
+
+        if not isinstance(raw.offset, int) or not 0 <= raw.offset <= len(site):
+            raise _bad_request(f"酶 {enzyme_id} 的切割偏移须为 0～{len(site)} 的整数")
+
+        # 完全酶切规则没有该字段，默认 1.0（必然切开）
+        probability = getattr(raw, "cut_probability", 1.0)
+        if not isinstance(probability, (int, float)) or not 0.0 <= probability <= 1.0:
+            raise _bad_request(f"酶 {enzyme_id} 的单点切开概率须为 0～1 之间的数")
+
+        normalized_enzymes.append(
+            {
+                "id": enzyme_id,
+                "site": site,
+                "offset": raw.offset,
+                "cut_probability": float(probability),
+            }
+        )
+
+    return sequence, raw_topology, normalized_enzymes
+
+
+def _normalize_redesign_inputs(
+    raw_sequence: str, raw_topology: str, raw_enzymes: list[RedesignEnzymeRule]
+) -> tuple[str, list[dict]]:
+    """/api/synonymous-redigest 的参数校验与规范化。
+
+    只接收线性、6～300 位且长度为 3 的倍数的 DNA；酶取 1～3 条，识别串
+    3～6 位。偏移/概率与同义重设计无关，不参与校验。
+    """
+    # ---- DNA 序列 ----
+    sequence = WHITESPACE_RE.sub("", raw_sequence).upper()
+    if not REDESIGN_MIN_DNA_LEN <= len(sequence) <= REDESIGN_MAX_DNA_LEN:
+        raise _bad_request(
+            f"同义移除位点仅接受长度 {REDESIGN_MIN_DNA_LEN}～"
+            f"{REDESIGN_MAX_DNA_LEN} bp 的 DNA（当前 {len(sequence)} bp）"
+        )
+    if len(sequence) % 3 != 0:
+        raise _bad_request(
+            f"DNA 长度必须为 3 的倍数才能从首碱基按密码子分组（当前 "
+            f"{len(sequence)} bp）"
+        )
+    if not DNA_RE.fullmatch(sequence):
+        raise _bad_request("DNA 序列只能包含 A、C、G、T 字符")
+
+    # ---- 拓扑：重设计只处理线性序列 ----
+    if raw_topology != "linear":
+        if raw_topology not in ("linear", "circular"):
+            raise _bad_request("拓扑类型须为 linear（线性）或 circular（环状）")
+        raise _bad_request("同义移除位点仅支持线性（linear）序列")
+
+    # ---- 酶规则：1～3 条、识别串 3～6 位 ----
+    if not REDESIGN_MIN_ENZYMES <= len(raw_enzymes) <= REDESIGN_MAX_ENZYMES:
+        raise _bad_request(
+            f"同义移除位点须选择 {REDESIGN_MIN_ENZYMES}～"
+            f"{REDESIGN_MAX_ENZYMES} 条酶（当前 {len(raw_enzymes)} 条）"
+        )
+
+    normalized_enzymes: list[dict] = []
+    seen_ids: set[str] = set()
+    for raw in raw_enzymes:
+        enzyme_id = raw.id.strip()
+        if not enzyme_id:
+            raise _bad_request("每条酶规则都必须填写唯一 ID")
+        if enzyme_id in seen_ids:
+            raise _bad_request(f"酶 ID 重复：{enzyme_id}")
+        seen_ids.add(enzyme_id)
+
+        site = WHITESPACE_RE.sub("", raw.site).upper()
+        if not REDESIGN_MIN_SITE_LEN <= len(site) <= REDESIGN_MAX_SITE_LEN:
+            raise _bad_request(
+                f"酶 {enzyme_id} 的识别串长度须为 {REDESIGN_MIN_SITE_LEN}～"
+                f"{REDESIGN_MAX_SITE_LEN} 位（当前 {len(site)} 位）"
+            )
+        if not IUPAC_RE.fullmatch(site):
+            raise _bad_request(
+                f"酶 {enzyme_id} 的识别串含非法字符，仅允许 IUPAC 码："
+                "A C G T R Y S W K M B D H V N"
+            )
+        normalized_enzymes.append({"id": enzyme_id, "site": site})
+
+    return sequence, normalized_enzymes
+
+
+@app.post("/api/digest")
+def digest(request: DigestRequest) -> dict:
+    sequence, topology, enzymes = _normalize_inputs(
+        request.sequence, request.topology, request.enzymes
+    )
+    return compute_digest(sequence, topology, enzymes)
+
+
+@app.post("/api/partial-digest")
+def partial_digest(request: PartialDigestRequest) -> dict:
+    sequence, topology, enzymes = _normalize_inputs(
+        request.sequence, request.topology, request.enzymes
+    )
+    return compute_partial_digest(sequence, topology, enzymes)
+
+
+@app.post("/api/synonymous-redesign")
+def synonymous_redesign_api(request: SynonymousRedesignRequest) -> dict:
+    sequence, enzymes = _normalize_redesign_inputs(
+        request.sequence, request.topology, request.enzymes
+    )
+    try:
+        return synonymous_redesign(sequence, enzymes)
+    except RedesignInputError as exc:
+        raise _bad_request(str(exc)) from exc
+
+
+def _normalize_inference_observation(
+    raw_bands: list[int], tolerance: int, max_missing: int
+) -> tuple[list[int], int, int]:
+    """/api/digest-inference 的观测条带、容差、漏检数校验。"""
+    # bool 是 int 的子类，显式排除以免 True/False 混入
+    bands = [
+        band for band in raw_bands
+        if isinstance(band, int) and not isinstance(band, bool)
+    ]
+    if len(bands) != len(raw_bands):
+        raise _bad_request("观测条带长度须全部为整数")
+    if not MIN_BANDS <= len(bands) <= MAX_BANDS:
+        raise _bad_request(
+            f"观测条带数量须为 {MIN_BANDS}～{MAX_BANDS} 条（当前 {len(bands)} 条）"
+        )
+    for band in bands:
+        if band < 1:
+            raise _bad_request("观测条带长度须为正整数（≥ 1 bp）")
+
+    if not isinstance(tolerance, int) or isinstance(tolerance, bool):
+        raise _bad_request("容差须为整数")
+    if not MIN_TOLERANCE <= tolerance <= MAX_TOLERANCE:
+        raise _bad_request(
+            f"容差须为 {MIN_TOLERANCE}～{MAX_TOLERANCE} bp（当前 {tolerance} bp）"
+        )
+
+    if not isinstance(max_missing, int) or isinstance(max_missing, bool):
+        raise _bad_request("允许漏检数须为整数")
+    if not MIN_MISSING <= max_missing <= MAX_MISSING:
+        raise _bad_request(
+            f"允许漏检数须为 {MIN_MISSING}～{MAX_MISSING} 条（当前 {max_missing} 条）"
+        )
+
+    return bands, tolerance, max_missing
+
+
+@app.post("/api/digest-inference")
+def digest_inference_api(request: DigestInferenceRequest) -> dict:
+    sequence, topology, enzymes = _normalize_inputs(
+        request.sequence, request.topology, request.enzymes
+    )
+    observed, tolerance, max_missing = _normalize_inference_observation(
+        request.observed_bands, request.tolerance, request.max_missing
+    )
+    return digest_inference(
+        sequence, topology, enzymes, observed, tolerance, max_missing
+    )
+
+
+def _normalize_isolation_params(
+    raw_start: int, raw_end: int, raw_spacing: int, topology: str, n: int
+) -> tuple[int, int, int]:
+    """/api/fragment-isolation 的目标区间与最小条带间距校验。"""
+    # bool 是 int 的子类，显式排除以免 True/False 混入
+    for value, name in (
+        (raw_start, "目标起点"),
+        (raw_end, "目标终点"),
+        (raw_spacing, "最小条带间距"),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise _bad_request(f"{name}须为整数")
+
+    if not MIN_SPACING <= raw_spacing <= MAX_SPACING:
+        raise _bad_request(
+            f"最小条带间距须为 {MIN_SPACING}～{MAX_SPACING} bp"
+            f"（当前 {raw_spacing} bp）"
+        )
+
+    if topology == "linear":
+        if not 0 <= raw_start < raw_end <= n:
+            raise _bad_request(
+                "线性目标区间须满足 0 ≤ 起点 < 终点 ≤ 序列长度"
+                f"（当前 [{raw_start}, {raw_end})，序列 {n} bp）"
+            )
+        if raw_end - raw_start >= n:
+            raise _bad_request(
+                f"线性目标区间须短于序列全长（当前长度 {raw_end - raw_start} bp，"
+                f"序列 {n} bp）"
+            )
+    else:
+        if not (0 <= raw_start < n and 0 <= raw_end < n):
+            raise _bad_request(
+                f"环状目标坐标须均在 [0, {n}) 内"
+                f"（当前起点 {raw_start}、终点 {raw_end}）"
+            )
+        if raw_start == raw_end:
+            raise _bad_request(
+                "环状目标起点与终点不能相等"
+                "（start > end 表示跨原点，目标弧长须为 1～全长−1 bp）"
+            )
+
+    return raw_start, raw_end, raw_spacing
+
+
+@app.post("/api/fragment-isolation")
+def fragment_isolation_api(request: FragmentIsolationRequest) -> dict:
+    sequence, topology, enzymes = _normalize_inputs(
+        request.sequence, request.topology, request.enzymes
+    )
+    start, end, min_spacing = _normalize_isolation_params(
+        request.target_start,
+        request.target_end,
+        request.min_spacing,
+        topology,
+        len(sequence),
+    )
+    return fragment_isolation(sequence, topology, enzymes, start, end, min_spacing)
+
+
+def _normalize_assembly_target(raw_target: str) -> str:
+    """/api/fragment-assembly 的目标线性序列校验（1～5000 位 A/C/G/T）。"""
+    target = WHITESPACE_RE.sub("", raw_target).upper()
+    if not MIN_TARGET_LEN <= len(target) <= MAX_TARGET_LEN:
+        raise _bad_request(
+            f"目标序列长度须为 {MIN_TARGET_LEN}～{MAX_TARGET_LEN} 位"
+            f"（当前 {len(target)} 位）"
+        )
+    if not DNA_RE.fullmatch(target):
+        raise _bad_request("目标序列只能包含 A、C、G、T 字符")
+    return target
+
+
+@app.post("/api/fragment-assembly")
+def fragment_assembly_api(request: FragmentAssemblyRequest) -> dict:
+    sequence, topology, enzymes = _normalize_inputs(
+        request.sequence, request.topology, request.enzymes
+    )
+    target = _normalize_assembly_target(request.target_sequence)
+    try:
+        return fragment_assembly(sequence, topology, enzymes, target)
+    except AssemblyInputError as exc:
+        raise _bad_request(str(exc)) from exc
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
