@@ -281,6 +281,42 @@
     <div class="meta">目标长度：<strong id="asmTargetLen">0</strong> bp</div>
   </section>
 
+  <section class="card" id="circularMapCard" style="margin-top:18px;">
+    <h2>环状双酶图谱重建</h2>
+    <div class="legend" style="margin-bottom:10px;">
+      <strong>只依据实验长度</strong>，不需要 DNA 序列或酶识别串：假定同一环状分子被完全切开、
+      A、B 切点互不重合，输入 A、B 各自单酶切及 A+B 双酶切的片段长度多重集（重复长度按出现次数计）。
+      枚举双酶片段的环上次序与边界的 A/B 归属，只保留能同时重现两组单酶长度多重集的图谱；
+      旋转与镜像视为同一图谱，每类取（切点标签, 其后间距）序列字典序最小的表示并据此从 0 计坐标。
+    </div>
+    <div class="infer-grid">
+      <div class="cell">
+        <label class="field" for="cmA">A 单酶切片段长度（1～3 片，逗号/空白分隔）</label>
+        <input class="infer-bands" id="cmA" type="text" spellcheck="false" placeholder="如 10">
+      </div>
+      <div class="cell">
+        <label class="field" for="cmB">B 单酶切片段长度（1～3 片，逗号/空白分隔）</label>
+        <input class="infer-bands" id="cmB" type="text" spellcheck="false" placeholder="如 4, 6">
+      </div>
+      <div class="cell">
+        <label class="field" for="cmDouble">A+B 双酶切片段长度（2～6 片，逗号/空白分隔）</label>
+        <input class="infer-bands" id="cmDouble" type="text" spellcheck="false" placeholder="如 2, 4, 4">
+      </div>
+    </div>
+    <div class="legend" style="margin-top:8px;">
+      前提：各长度为正整数；三组总长相等且为 4～5000 bp；双酶切片段数 = A、B 单酶切片段数之和。
+      违反前提返回 HTTP 400；前提满足但无图谱能重现两组单酶长度时明确说明无解。
+    </div>
+    <div class="run-row" style="margin-top:10px;">
+      <button class="btn primary" id="runCircularMap" type="button">重建环状图谱</button>
+    </div>
+  </section>
+
+  <section class="card" id="circularMapResults" style="margin-top:18px; display:none;">
+    <h2>环状双酶图谱重建结果</h2>
+    <div id="circularMapBody"></div>
+  </section>
+
   <section class="card" id="results" style="margin-top:18px; display:none;">
     <h2>计算结果</h2>
     <div class="summary" id="summary"></div>
@@ -1132,12 +1168,136 @@ document.getElementById("runAssembly").addEventListener("click", () => {
     buildAssemblyRequest);
 });
 
+// ---------- 环状双酶图谱重建 ----------
+function parseLengthGroup(inputId, name, minCount, maxCount) {
+  const raw = document.getElementById(inputId).value;
+  const tokens = raw.split(/[\s,，;；、]+/).filter((t) => t !== "");
+  if (tokens.length < minCount || tokens.length > maxCount) {
+    throw new Error(`${name}数量须为 ${minCount}～${maxCount} 条（当前 ${tokens.length} 条）`);
+  }
+  const values = [];
+  for (const token of tokens) {
+    if (!/^\d+$/.test(token)) {
+      throw new Error(`${name}长度须为正整数：“${token}” 不合法`);
+    }
+    const value = Number(token);
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error(`${name}长度须为 ≥ 1 的正整数：“${token}” 不合法`);
+    }
+    values.push(value);
+  }
+  return values;
+}
+
+function buildCircularMapRequest() {
+  const a = parseLengthGroup("cmA", "A 单酶切片段", 1, 3);
+  const b = parseLengthGroup("cmB", "B 单酶切片段", 1, 3);
+  const dbl = parseLengthGroup("cmDouble", "双酶切片段", 2, 6);
+
+  if (dbl.length !== a.length + b.length) {
+    throw new Error(
+      `双酶切片段数须等于两组单酶切片段数之和（当前双酶切 ${dbl.length} 片，` +
+      `A 单酶切 ${a.length} 片 + B 单酶切 ${b.length} 片）`);
+  }
+  const sum = (xs) => xs.reduce((acc, x) => acc + x, 0);
+  const totalA = sum(a), totalB = sum(b), totalD = sum(dbl);
+  if (!(totalA === totalB && totalB === totalD)) {
+    throw new Error(
+      `三组片段总长相等才可能是同一环状分子（当前 A 单酶切 ${totalA} bp、` +
+      `B 单酶切 ${totalB} bp、双酶切 ${totalD} bp）`);
+  }
+  if (totalD < 4 || totalD > 5000) {
+    throw new Error(`环状分子总长须为 4～5000 bp（当前 ${totalD} bp）`);
+  }
+  return { a_lengths: a, b_lengths: b, double_lengths: dbl };
+}
+
+function renderCircularMap(data) {
+  const body = document.getElementById("circularMapBody");
+  const headChips = [
+    `<span class="chip">环状分子总长：${data.total_length} bp</span>`,
+    `<span class="chip">A 切点：${data.a_cut_count} 个</span>`,
+    `<span class="chip">B 切点：${data.b_cut_count} 个</span>`,
+    `<span class="chip">总切点：${data.cut_count} 个</span>`,
+    `<span class="chip">枚举候选：${data.arrangements_checked} 种</span>`,
+    `<span class="chip">不同图谱数：<strong>${data.map_count}</strong></span>`,
+  ];
+  const inputMeta =
+    `<div class="meta" style="margin-bottom:10px;">输入（重复长度按出现次数计）：`
+    + `A 单酶切 <code class="seq">[${data.a_lengths.join(", ")}]</code>；`
+    + `B 单酶切 <code class="seq">[${data.b_lengths.join(", ")}]</code>；`
+    + `A+B 双酶切 <code class="seq">[${data.double_lengths.join(", ")}]</code></div>`;
+
+  if (!data.solvable) {
+    body.innerHTML =
+      `<div class="summary">${headChips.join("")}</div>`
+      + inputMeta
+      + `<div class="infer-warn"><strong>无解：</strong>${escapeHtml(data.message.replace(/^无解：/, ""))}</div>`;
+    document.getElementById("circularMapResults").style.display = "block";
+    return;
+  }
+
+  const mapHtml = data.maps.map((map, i) => {
+    const cutRows = map.cut_points.map((cp) => {
+      const tagClass = cp.label === "A" ? "tag status-required" : "tag status-optional";
+      return `<tr>
+        <td>${cp.position}</td>
+        <td><span class="${tagClass}">${cp.label}</span></td>
+        <td>${cp.next_distance}</td>
+      </tr>`;
+    }).join("");
+    const fragRows = map.fragments.map((f) => {
+      const range = f.wraps_origin
+        ? `[${f.start}, ${f.end})（绕回原点 0）`
+        : `[${f.start}, ${f.end})`;
+      return `<tr><td>${f.index}</td><td>${range}</td><td>${f.length}</td></tr>`;
+    }).join("");
+    const orderText = map.cyclic_order
+      .map((item) => `${item.label}→${item.next_distance}`)
+      .join("，");
+    return `<h2 style="margin-top:18px;">图谱 ${i + 1}</h2>
+      <div class="meta" style="margin-bottom:6px;">环上次序（切点标签→其后间距，字典序最小表示）：`
+      + `<code class="seq">${escapeHtml(orderText)}</code></div>`
+      + `<div class="meta" style="margin-bottom:6px;">复现单酶切长度：`
+      + `A <code class="seq">[${map.a_fragment_lengths.join(", ")}]</code>；`
+      + `B <code class="seq">[${map.b_fragment_lengths.join(", ")}]</code></div>`
+      + `<table><thead><tr>`
+      + `<th style="width:22%">切点坐标（0 基）</th><th style="width:22%">切点标签</th>`
+      + `<th>到下一个切点的间距 (bp)</th>`
+      + `</tr></thead><tbody>${cutRows}</tbody></table>`
+      + `<table style="margin-top:8px;"><thead><tr>`
+      + `<th style="width:8%">片段 #</th><th style="width:34%">区间 [起, 止)</th>`
+      + `<th>长度 (bp)</th>`
+      + `</tr></thead><tbody>${fragRows}</tbody></table>`;
+  }).join("");
+
+  body.innerHTML =
+    `<div class="summary">${headChips.join("")}</div>`
+    + inputMeta
+    + `<div class="legend">旋转与镜像视为同一图谱；每类取（切点标签, 其后间距）序列字典序最小的表示，`
+    + `并据此从 0 起算各切点的相对坐标（坐标按环状分子相对位置给出，末片段绕回原点）。`
+    + `图谱按该规范表示的字典序排列。</div>`
+    + mapHtml;
+
+  document.getElementById("circularMapResults").style.display = "block";
+}
+
+document.getElementById("runCircularMap").addEventListener("click", () => {
+  const btn = document.getElementById("runCircularMap");
+  runCalculation(btn, "重建环状图谱", "/api/circular-map-reconstruction",
+    renderCircularMap, buildCircularMapRequest);
+});
+
 // 预置一条示例酶并填入示例序列，方便直接试用
 addEnzymeRow("EcoRV-like", "GATATC", "3", "0.8");
 sequenceInput.value = "AAAGATATCGGGGATATCTTTGATATCAAA";
 seqLenSpan.textContent = cleanSequence().length;
 asmTargetInput.value = "ATCAAAGATAAAGAT";
 document.getElementById("asmTargetLen").textContent = cleanAsmTarget().length;
+// 环状双酶图谱重建示例：A 一切点、B 两切点，双酶切 3 片（唯一解）
+document.getElementById("cmA").value = "10";
+document.getElementById("cmB").value = "4, 6";
+document.getElementById("cmDouble").value = "2, 4, 4";
 </script>
 </body>
 </html>

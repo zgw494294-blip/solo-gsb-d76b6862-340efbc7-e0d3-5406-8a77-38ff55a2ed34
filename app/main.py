@@ -15,6 +15,15 @@ from .assembly import (
     AssemblyInputError,
     fragment_assembly,
 )
+from .circular_map import (
+    MAX_DOUBLE_FRAGMENTS,
+    MAX_SINGLE_FRAGMENTS,
+    MAX_TOTAL_LEN,
+    MIN_DOUBLE_FRAGMENTS,
+    MIN_SINGLE_FRAGMENTS,
+    MIN_TOTAL_LEN,
+    reconstruct_circular_map,
+)
 from .digest import IUPAC_BASES, compute_digest, compute_partial_digest
 from .inference import (
     MAX_BANDS,
@@ -28,7 +37,7 @@ from .inference import (
 from .isolation import MAX_SPACING, MIN_SPACING, fragment_isolation
 from .redesign import RedesignInputError, synonymous_redesign
 
-app = FastAPI(title="DNA 虚拟平切酶酶切图谱", version="1.5.0")
+app = FastAPI(title="DNA 虚拟平切酶酶切图谱", version="1.6.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -106,6 +115,13 @@ class FragmentAssemblyRequest(BaseModel):
     topology: str
     enzymes: list[EnzymeRule]  # 拼接做完全酶切，忽略单点切开概率
     target_sequence: str
+
+
+class CircularMapReconstructionRequest(BaseModel):
+    # 只依据实验长度：三组片段长度多重集，不需要 DNA 序列或酶识别串
+    a_lengths: list[int]
+    b_lengths: list[int]
+    double_lengths: list[int]
 
 
 def _bad_request(message: str) -> HTTPException:
@@ -395,6 +411,77 @@ def fragment_assembly_api(request: FragmentAssemblyRequest) -> dict:
         return fragment_assembly(sequence, topology, enzymes, target)
     except AssemblyInputError as exc:
         raise _bad_request(str(exc)) from exc
+
+
+def _normalize_circular_map_inputs(
+    raw_a: list[int], raw_b: list[int], raw_double: list[int]
+) -> tuple[list[int], list[int], list[int]]:
+    """/api/circular-map-reconstruction 的三组片段长度前提校验。
+
+    各长度为正整数；A、B 各 1～3 片，双酶切 2～6 片；三组总长相等且为
+    4～5000 bp；双酶片数须等于两组单酶片数之和（同一环状分子被完全切开、
+    A、B 切点互不重合）。违反任一前提返回 HTTP 400。
+    """
+
+    def check_group(raw: list[int], name: str, lo: int, hi: int) -> list[int]:
+        # bool 是 int 的子类，显式排除以免 True/False 混入
+        values = [
+            value for value in raw
+            if isinstance(value, int) and not isinstance(value, bool)
+        ]
+        if len(values) != len(raw):
+            raise _bad_request(f"{name}长度须全部为整数")
+        if not lo <= len(values) <= hi:
+            raise _bad_request(
+                f"{name}数须为 {lo}～{hi} 条（当前 {len(values)} 条）"
+            )
+        for value in values:
+            if value < 1:
+                raise _bad_request(f"{name}长度须为正整数（≥ 1 bp）")
+        return values
+
+    a_lengths = check_group(raw_a, "A 单酶切片段", MIN_SINGLE_FRAGMENTS, MAX_SINGLE_FRAGMENTS)
+    b_lengths = check_group(raw_b, "B 单酶切片段", MIN_SINGLE_FRAGMENTS, MAX_SINGLE_FRAGMENTS)
+    double_lengths = check_group(
+        raw_double, "双酶切片段", MIN_DOUBLE_FRAGMENTS, MAX_DOUBLE_FRAGMENTS
+    )
+
+    if len(double_lengths) != len(a_lengths) + len(b_lengths):
+        raise _bad_request(
+            "双酶切片段数须等于两组单酶切片段数之和"
+            f"（当前双酶切 {len(double_lengths)} 片，"
+            f"A 单酶切 {len(a_lengths)} 片 + B 单酶切 {len(b_lengths)} 片）；"
+            "同一环状分子被完全切开且 A、B 切点互不重合时两者必须相等"
+        )
+
+    total_a, total_b, total_double = (
+        sum(a_lengths),
+        sum(b_lengths),
+        sum(double_lengths),
+    )
+    if not (total_a == total_b == total_double):
+        raise _bad_request(
+            "三组片段总长相等才可能是同一环状分子"
+            f"（当前 A 单酶切 {total_a} bp、B 单酶切 {total_b} bp、"
+            f"双酶切 {total_double} bp）"
+        )
+    if not MIN_TOTAL_LEN <= total_double <= MAX_TOTAL_LEN:
+        raise _bad_request(
+            f"环状分子总长须为 {MIN_TOTAL_LEN}～{MAX_TOTAL_LEN} bp"
+            f"（当前 {total_double} bp）"
+        )
+
+    return a_lengths, b_lengths, double_lengths
+
+
+@app.post("/api/circular-map-reconstruction")
+def circular_map_reconstruction_api(
+    request: CircularMapReconstructionRequest,
+) -> dict:
+    a_lengths, b_lengths, double_lengths = _normalize_circular_map_inputs(
+        request.a_lengths, request.b_lengths, request.double_lengths
+    )
+    return reconstruct_circular_map(a_lengths, b_lengths, double_lengths)
 
 
 @app.get("/")

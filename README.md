@@ -14,7 +14,7 @@ docker compose up --build
 **http://localhost:8000**
 
 单页内包含全部功能区块：完全酶切、部分酶切丰度分析、同义移除位点、观测条带反推、
-目标片段分离设计与平切片段拼接；各 HTTP API 见下文。
+目标片段分离设计、平切片段拼接与环状双酶图谱重建；各 HTTP API 见下文。
 
 停止：`Ctrl+C`（后台运行则用 `docker compose down`）。
 
@@ -105,6 +105,23 @@ docker compose up --build
   - 页面与 API 给出**有序编号**、**方向**、**各片段在目标中的 0 基半开区间**、
     **各片段拼接序列**与整体拼接序列；无解时 HTTP 200 返回 `solvable: false` 与
     原因（区分“环状未切开不可作原料”等情况）。
+- **环状双酶图谱重建**（页面区块“环状双酶图谱重建”/ `POST /api/circular-map-reconstruction`）：
+  - **只依据实验长度**，不要求 DNA 序列或酶识别串：输入 A、B 各自单酶切及
+    A+B 双酶切的**片段长度多重集**（重复长度按出现次数计）；
+  - 前提：各长度为**正整数**；A、B 各 **1～3 片**，双酶切 **2～6 片**；
+    **三组总长相等且为 4～5000 bp**；假定同一环状分子被完全切开、A、B 切点
+    互不重合，故**双酶切片段数须等于两组单酶切片段数之和**；违反任一前提
+    返回 HTTP 400；
+  - **枚举双酶片段的环上次序及边界的 A/B 归属**（双酶片段数 m ≤ 6，候选为
+    m 的排列数 × C(m, A 切点数) 种），只保留能**同时重现两组单酶长度多重集**
+    的图谱：忽略非 X 切点后，相邻两个 X 切点沿环的间距之和即 X 单酶切的一条
+    片段（X 仅一个切点时整环总长即其唯一片段）；
+  - **旋转与镜像视为同一图谱**：每类取全部 2m 种线性化中（切点标签, 其后间距）
+    序列**字典序最小**的表示（标签 A<B、间距按数值），并据此**从 0 起算各切点
+    的相对坐标**；图谱之间按该规范表示排序；
+  - 页面与 API 给出全部不同图谱的**切点标签、0 基相对坐标与相邻间距**（含各
+    片段区间与复现出的两组单酶长度）；无解时 HTTP 200 返回 `solvable: false`
+    与明确说明。
 
 ## 坐标约定（示例）
 
@@ -370,6 +387,68 @@ curl -s -X POST http://localhost:8000/api/fragment-assembly \
 `solvable: false`、`circular_uncut: true`）；完全酶切片段数超过 16 条或
 目标序列不满足 1～5000 位 A/C/G/T 时返回 HTTP 400，`detail` 为中文原因。
 
+`POST /api/circular-map-reconstruction`
+
+环状双酶图谱重建：**只依据实验长度**，不需要 DNA 序列或酶识别串。请求体为三组
+片段长度多重集：`a_lengths`（A 单酶切，1～3 片）、`b_lengths`（B 单酶切，
+1～3 片）、`double_lengths`（A+B 双酶切，2～6 片）。
+
+```json
+{
+  "a_lengths": [10],
+  "b_lengths": [4, 6],
+  "double_lengths": [2, 4, 4]
+}
+```
+
+返回字段：`total_length`（环状分子总长）、`a_lengths` / `b_lengths` /
+`double_lengths`（按输入顺序，重复保留）、`a_cut_count` / `b_cut_count` /
+`cut_count`（切点数，双酶切片段数 = 两组单酶切片段数之和）、
+`arrangements_checked`（枚举的候选排布数）、`map_count`、`maps[]`、
+`solvable`。每张图谱包含：`cut_points[]`（`position` 0 基相对坐标 /
+`label` 切点标签 A 或 B / `next_distance` 到下一个切点的间距，按坐标升序）、
+`fragments[]`（`index` / `start` / `end` / `length` / `wraps_origin`，
+末片段绕回原点）、`cyclic_order[]`（字典序最小表示的环上 标签→间距 序列）、
+`a_fragment_lengths` / `b_fragment_lengths`（该图谱复现出的两组单酶长度，
+升序）。旋转与镜像视为同一图谱，每类取（切点标签, 其后间距）序列字典序最小
+的表示并据此从 0 计坐标；图谱按该规范表示排序。
+
+```bash
+curl -s -X POST http://localhost:8000/api/circular-map-reconstruction \
+  -H 'Content-Type: application/json' \
+  -d '{"a_lengths":[10],"b_lengths":[4,6],"double_lengths":[2,4,4]}'
+# ... "solvable":true,"map_count":1,
+#     "maps":[{"cut_points":[{"position":0,"label":"A","next_distance":2},
+#       {"position":2,"label":"B","next_distance":4},
+#       {"position":6,"label":"B","next_distance":4}], ...}]
+```
+
+上例唯一解：A 切点在 0，B 切点在 2、6；A 单酶切得整环 10 bp，B 单酶切得
+4 bp（2→6）与 6 bp（6→0→2），双酶切得 2、4、4 bp。无解时（前提满足但没有任何
+图谱能同时重现两组单酶长度多重集）返回 HTTP 200、`solvable: false` 与
+`message` 明确说明：
+
+```bash
+curl -s -X POST http://localhost:8000/api/circular-map-reconstruction \
+  -H 'Content-Type: application/json' \
+  -d '{"a_lengths":[2,4],"b_lengths":[3,3],"double_lengths":[1,1,1,3]}'
+# {"...","solvable":false,"map_count":0,"message":"无解：在 24 种候选排布
+#  （双酶片段环上次序 × 边界 A/B 归属）中，没有任何图谱能同时重现 A、B
+#  两组单酶切片段长度多重集。"}
+```
+
+前提不满足时返回 HTTP 400，`detail` 为中文原因。例如双酶切片段数不等于两组
+单酶切片段数之和（1 + 1 ≠ 3）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/circular-map-reconstruction \
+  -H 'Content-Type: application/json' \
+  -d '{"a_lengths":[6],"b_lengths":[6],"double_lengths":[1,2,3]}'
+# {"detail":"双酶切片段数须等于两组单酶切片段数之和（当前双酶切 3 片，
+#  A 单酶切 1 片 + B 单酶切 1 片）；同一环状分子被完全切开且 A、B 切点
+#  互不重合时两者必须相等"}
+```
+
 ## 不用 Docker 的本地开发
 
 ```bash
@@ -387,8 +466,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── inference.py       # 纯函数：观测条带反推（枚举酶子集、多重集配对、必有/可有/不可能统计）
 │   ├── isolation.py       # 纯函数：目标片段分离设计（枚举非空酶组合、目标片段覆盖判定、条带间距筛选）
 │   ├── assembly.py        # 纯函数：平切片段拼接（子集动态规划、+ / − 方向、最少片段数 + 路径字典序并列）
-│   ├── main.py            # FastAPI：参数校验、/api/digest、/api/partial-digest、/api/synonymous-redesign、/api/digest-inference、/api/fragment-isolation、/api/fragment-assembly、页面路由
-│   └── static/index.html  # 原生 HTML/CSS/JS 单页（含概率输入、丰度表、同义重设计、条带反推、目标片段分离与平切片段拼接）
+│   ├── circular_map.py    # 纯函数：环状双酶图谱重建（枚举片段环上次序 × 边界归属、二面体规范化、0 基坐标）
+│   ├── main.py            # FastAPI：参数校验、/api/digest、/api/partial-digest、/api/synonymous-redesign、/api/digest-inference、/api/fragment-isolation、/api/fragment-assembly、/api/circular-map-reconstruction、页面路由
+│   └── static/index.html  # 原生 HTML/CSS/JS 单页（含概率输入、丰度表、同义重设计、条带反推、目标片段分离、平切片段拼接与环状双酶图谱重建）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
