@@ -14,7 +14,7 @@ docker compose up --build
 **http://localhost:8000**
 
 单页内包含全部功能区块：完全酶切、部分酶切丰度分析、同义移除位点、观测条带反推、
-目标片段分离设计与平切片段拼接；各 HTTP API 见下文。
+目标片段分离设计、平切片段拼接与环状双酶图谱重建；各 HTTP API 见下文。
 
 停止：`Ctrl+C`（后台运行则用 `docker compose down`）。
 
@@ -105,6 +105,20 @@ docker compose up --build
   - 页面与 API 给出**有序编号**、**方向**、**各片段在目标中的 0 基半开区间**、
     **各片段拼接序列**与整体拼接序列；无解时 HTTP 200 返回 `solvable: false` 与
     原因（区分“环状未切开不可作原料”等情况）。
+- **环状双酶图谱重建**（页面区块“环状双酶图谱重建”/ `POST /api/circular-map-reconstruction`）：
+  - **只依据实验长度，不要求 DNA 序列或酶识别串**：输入 A、B 各自单酶切
+    （各 **1～3 片**）及 A+B 双酶切（**2～6 片**）的片段长度多重集；各长度为
+    **正整数**，**重复长度按出现次数计算**，三组总长须相等且为 **4～5000 bp**；
+  - 假定同一环状分子被**完全切开**且 **A、B 切点互不重合**，故**双酶片数须等于
+    两组单酶片数之和**；违反任一前提返回 HTTP 400，`detail` 为中文原因；
+  - **枚举**双酶片段的**环上次序**（多重集排列）及每个边界的 **A/B 归属**
+    （恰 a 个 A、b 个 B），只保留能**重现两组单酶长度多重集**的图谱：
+    从每个 A 边界顺时针到下一个 A 边界的弧长之和须组成 A 的多重集，B 同理；
+  - **旋转与镜像视为同一图谱**：每类取（**切点标签, 其后间距**）序列在全部旋转
+    与正/反两个方向下的**字典序最小表示**作为规范形式去重，并据此**从 0 计坐标**
+    （首个切点位于 0）、图谱间按规范表示**排序**；
+  - 页面与 API 给出全部不同图谱的**切点标签**、**0 基相对坐标**与**相邻间距**
+    （含两端切点标签）；无解时 HTTP 200 返回 `solvable: false` 与明确说明。
 
 ## 坐标约定（示例）
 
@@ -370,6 +384,61 @@ curl -s -X POST http://localhost:8000/api/fragment-assembly \
 `solvable: false`、`circular_uncut: true`）；完全酶切片段数超过 16 条或
 目标序列不满足 1～5000 位 A/C/G/T 时返回 HTTP 400，`detail` 为中文原因。
 
+`POST /api/circular-map-reconstruction`
+
+环状双酶图谱重建：**只依据实验长度**，不需要 DNA 序列与酶规则。请求体为
+`a_fragments` / `b_fragments`（A、B 各自单酶切，各 1～3 个正整数）与
+`double_fragments`（A+B 双酶切，2～6 个正整数）；三组总长须相等且为
+4～5000 bp，且双酶片数须等于两组单酶片数之和（完全切开、A/B 切点互不重合
+的前提），违反任一前提返回 HTTP 400。
+
+```json
+{
+  "a_fragments": [30, 70],
+  "b_fragments": [40, 60],
+  "double_fragments": [10, 20, 30, 40]
+}
+```
+
+返回字段：`total_length`（环状分子总长）、`a_fragments` / `b_fragments` /
+`double_fragments`（按输入顺序，重复保留）、`a_site_count` / `b_site_count` /
+`site_count`（切点数）、`candidate_count`（检查的候选数：片段环序 × 边界
+A/B 归属）、`map_count`、`maps[]`（每张图谱：`map_index`、`signature`
+（规范表示，如 `A10 B20 A40 B30`）、`sites[]`（`index` / `label`（A 或 B）/
+`position`（0 基相对坐标，首个切点为 0））、`fragments[]`（`index` /
+`start` / `end` / `length`（相邻切点间距）/ `left_label` / `right_label`，
+末片段的 `end` 即总长、绕回 1 号切点））、`solvable`。图谱按规范表示排序，
+旋转与镜像不重复计数。
+
+```bash
+curl -s -X POST http://localhost:8000/api/circular-map-reconstruction \
+  -H 'Content-Type: application/json' \
+  -d '{"a_fragments":[30,70],"b_fragments":[40,60],"double_fragments":[10,20,30,40]}'
+# "map_count":2，图谱 1：A@0、B@10、A@30、B@70（间距 10/20/40/30）；
+# 图谱 2：A@0、B@10、B@50、A@70（间距 10/40/20/30）
+```
+
+无解时返回 HTTP 200、`solvable: false`、空的 `maps` 与 `message` 明确说明：
+
+```bash
+curl -s -X POST http://localhost:8000/api/circular-map-reconstruction \
+  -H 'Content-Type: application/json' \
+  -d '{"a_fragments":[30,70],"b_fragments":[41,59],"double_fragments":[10,20,30,40]}'
+# {"...","solvable":false,"message":"无解：枚举了 144 种候选（4 条双酶片段的
+#  全部不同环序 × 边界的 A/B 归属组合），没有任何一种能同时重现……"}
+```
+
+前提不满足时返回 HTTP 400，`detail` 为中文原因，例如双酶片数不等于两组
+单酶片数之和：
+
+```bash
+curl -s -X POST http://localhost:8000/api/circular-map-reconstruction \
+  -H 'Content-Type: application/json' \
+  -d '{"a_fragments":[30,70],"b_fragments":[40,60],"double_fragments":[10,20,70]}'
+# {"detail":"前提不成立：完全切开且 A、B 切点互不重合时，双酶切片段数须等于
+#  两组单酶切片段数之和（当前 A 单酶切 2 片 + B 单酶切 2 片 = 4 片，双酶切 3 片）"}
+```
+
 ## 不用 Docker 的本地开发
 
 ```bash
@@ -387,8 +456,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── inference.py       # 纯函数：观测条带反推（枚举酶子集、多重集配对、必有/可有/不可能统计）
 │   ├── isolation.py       # 纯函数：目标片段分离设计（枚举非空酶组合、目标片段覆盖判定、条带间距筛选）
 │   ├── assembly.py        # 纯函数：平切片段拼接（子集动态规划、+ / − 方向、最少片段数 + 路径字典序并列）
-│   ├── main.py            # FastAPI：参数校验、/api/digest、/api/partial-digest、/api/synonymous-redesign、/api/digest-inference、/api/fragment-isolation、/api/fragment-assembly、页面路由
-│   └── static/index.html  # 原生 HTML/CSS/JS 单页（含概率输入、丰度表、同义重设计、条带反推、目标片段分离与平切片段拼接）
+│   ├── reconstruction.py  # 纯函数：环状双酶图谱重建（枚举片段环序与边界 A/B 归属、旋转/镜像规范表示去重）
+│   ├── main.py            # FastAPI：参数校验、/api/digest、/api/partial-digest、/api/synonymous-redesign、/api/digest-inference、/api/fragment-isolation、/api/fragment-assembly、/api/circular-map-reconstruction、页面路由
+│   └── static/index.html  # 原生 HTML/CSS/JS 单页（含概率输入、丰度表、同义重设计、条带反推、目标片段分离、平切片段拼接与环状双酶图谱重建）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
